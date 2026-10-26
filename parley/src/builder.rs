@@ -225,7 +225,10 @@ impl<'b, B: Brush> TreeBuilder<'b, B> {
     }
 
     pub fn push_inline_box(&mut self, mut inline_box: InlineBox) {
-        if inline_box.kind == InlineBoxKind::InFlow {
+        if matches!(
+            inline_box.kind,
+            InlineBoxKind::InFlow | InlineBoxKind::InFlowCentered
+        ) {
             self.lcx.tree_style_builder.push_uncommitted_text(false);
             self.lcx.tree_style_builder.set_is_span_first(false);
             self.lcx

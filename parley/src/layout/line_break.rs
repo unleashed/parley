@@ -495,7 +495,9 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                     let inline_box = &self.layout.data.inline_boxes[item.index];
 
                     let (width_contribution, height_contribution) = match inline_box.kind {
-                        InlineBoxKind::InFlow => (inline_box.width, inline_box.height),
+                        InlineBoxKind::InFlow | InlineBoxKind::InFlowCentered => {
+                            (inline_box.width, inline_box.height)
+                        }
                         InlineBoxKind::OutOfFlow => (0.0, 0.0),
                         // If the box is a `CustomOutOfFlow` box then we yield control flow back to the caller.
                         // It is then the caller's responsibility to handle placement of the box.
@@ -734,7 +736,10 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                 LayoutItemKind::InlineBox => {
                     let inline_box = &self.layout.data.inline_boxes[item.index];
 
-                    if inline_box.kind != InlineBoxKind::InFlow {
+                    if !matches!(
+                        inline_box.kind,
+                        InlineBoxKind::InFlow | InlineBoxKind::InFlowCentered
+                    ) {
                         self.state.append_inline_box_to_line(self.state.line.x, 0.0);
                         continue;
                     }
@@ -926,13 +931,19 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                     let item = &self.layout.data.inline_boxes[line_item.index];
 
                     // Advance is already computed in "commit line" for items
-                    if item.kind == InlineBoxKind::InFlow {
-                        // Default vertical alignment is to align the bottom of boxes with the text baseline.
-                        // This is equivalent to the entire height of the box being "ascent"
-                        line.metrics.ascent = line.metrics.ascent.max(item.height);
+                    match item.kind {
+                        InlineBoxKind::InFlow => {
+                            // Default vertical alignment is to align the bottom of boxes with the text baseline.
+                            // This is equivalent to the entire height of the box being "ascent"
+                            line.metrics.ascent = line.metrics.ascent.max(item.height);
 
-                        // Mark us as having seen non-whitespace content on this line
-                        have_metrics = true;
+                            // Mark us as having seen non-whitespace content on this line
+                            have_metrics = true;
+                        }
+                        // The box already grew the line height; centred on the line, it leaves
+                        // the ascent and descent to the text, and the leading splits its overflow.
+                        InlineBoxKind::InFlowCentered => have_metrics = true,
+                        InlineBoxKind::OutOfFlow | InlineBoxKind::CustomOutOfFlow => {}
                     }
                 }
                 LayoutItemKind::TextRun => {

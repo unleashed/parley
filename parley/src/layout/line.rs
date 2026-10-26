@@ -266,12 +266,22 @@ impl<'a, B: Brush> Iterator for GlyphRunIter<'a, B> {
 
                     self.item_index += 1;
                     self.glyph_start = 0;
-                    if inline_box.kind == InlineBoxKind::InFlow {
+                    if matches!(
+                        inline_box.kind,
+                        InlineBoxKind::InFlow | InlineBoxKind::InFlowCentered
+                    ) {
                         self.offset += inline_box.width;
                     }
+                    let metrics = &self.line.data.metrics;
+                    let bottom = if inline_box.kind == InlineBoxKind::InFlowCentered {
+                        metrics.baseline
+                            - (metrics.ascent - metrics.descent - inline_box.height) * 0.5
+                    } else {
+                        metrics.baseline
+                    };
                     return Some(PositionedLayoutItem::InlineBox(PositionedInlineBox {
                         x,
-                        y: self.line.data.metrics.baseline - inline_box.height,
+                        y: bottom - inline_box.height,
                         width: inline_box.width,
                         height: inline_box.height,
                         id: inline_box.id,

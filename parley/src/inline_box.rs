@@ -26,6 +26,13 @@ pub enum InlineBoxKind {
     ///
     /// They correspond to `display: inline-block` boxes in CSS.
     InFlow,
+    /// `InFlowCentered` boxes take up space as `InFlow` boxes do, but sit centred on their line,
+    /// `(ascent - descent) / 2` above the baseline, rather than on the baseline: a box taller than
+    /// the line grows it by the whole overflow, half above and half below, and leaves the line's
+    /// ascent and descent to its text.
+    ///
+    /// They correspond to Godot's `INLINE_ALIGNMENT_CENTER` images (`TextServerAdvanced::_realign`).
+    InFlowCentered,
     /// `OutOfFlow` boxes are assigned a position as if they were a zero-sized inline box, but
     /// do not take up space in the layout.
     ///
