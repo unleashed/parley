@@ -644,6 +644,14 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                             }
                         }
 
+                        // Godot measures the cluster as its text server does (the `godot-wrap`
+                        // feature): the break test and the line's advance (the width a node sized
+                        // by its text gets, and the one alignment centres), while the glyphs keep
+                        // their exact positions.
+                        #[cfg(feature = "godot-wrap")]
+                        let advance =
+                            godot_advance(advance, run.font_size(), self.layout.data.scale);
+
                         // Compute the x position of the content being currently processed
                         let next_x = self.state.line.x + advance;
 
@@ -1203,6 +1211,28 @@ impl<B: Brush> Drop for BreakLines<'_, B> {
         // Save the computed lines to the layout
         self.lines.swap(&mut self.layout.data);
     }
+}
+
+/// Godot's advance of a cluster `advance` px wide in a run of `font_size` px laid out at `scale`
+/// (the `godot-wrap` feature). Godot shapes at the design size (`scale` 1) through `hb_ft`, whose
+/// positions are 26.6 fixed point rounded half up, and keeps them as they are up to 20 px under
+/// its default `SUBPIXEL_POSITIONING_AUTO` (`fs <= SUBPIXEL_POSITIONING_ONE_HALF_MAX_SIZE`,
+/// `modules/text_server_adv/text_server_adv.cpp:7199, 7338-7339` at 4.7.2-stable), so a line's
+/// width is a sum of 1/64 px steps: up to 1/128 px a glyph more than the exact advance, which
+/// tips a word whose line fits within a fraction of a pixel. Above 20 px Godot rounds each glyph
+/// to a whole pixel carrying the remainder (`:7341-7345`), within half a pixel of the exact sum,
+/// which is kept there.
+/// shortcut: the cluster is rounded as one where `HarfBuzz` rounds a glyph's advance and its
+/// kerning apart (1/64 px apart when both fall on a half step); round them apart if a break
+/// lands on that.
+#[cfg(feature = "godot-wrap")]
+fn godot_advance(advance: f32, font_size: f32, scale: f32) -> f32 {
+    const HALF_STEP_SLACK: f32 = 1e-3;
+    if font_size > 20.0 * scale + HALF_STEP_SLACK || scale <= 0.0 {
+        return advance;
+    }
+    // The slack keeps a half step that `f32` lands a hair short of rounding up, as `hb_ft` does.
+    (advance / scale * 64.0 + 0.5 + HALF_STEP_SLACK).floor() / 64.0 * scale
 }
 
 fn commit_line<B: Brush>(
