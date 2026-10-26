@@ -26,6 +26,10 @@ accesskit = ["dep:accesskit"]
 # Enables dictionary-based line and word breaking for complex scripts (CJK, Thai, Khmer, Lao, Myanmar).
 # When disabled, a lightweight segmenter is used that falls back to character-level breaks for those scripts.
 complex-scripts = []
+# Godot's word wrap in place of CSS's: a space that overflows the line is not hung but moves the
+# word before it to the next line, as Godot's `TextServer::shaped_text_get_line_breaks` counts the
+# space after a word against the width.
+godot-wrap = []
 
 [dependencies]
 skrifa = { workspace = true }

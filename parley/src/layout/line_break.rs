@@ -447,6 +447,15 @@ impl<'a, B: Brush> BreakLines<'a, B> {
         self.break_next_line_or_box()
     }
 
+    /// Whether the item before the current one is an [`InlineBoxKind::InFlowCentered`] box.
+    fn follows_centered_box(&self) -> bool {
+        self.state.item_idx.checked_sub(1).is_some_and(|i| {
+            let item = &self.layout.data.items[i];
+            item.kind == LayoutItemKind::InlineBox
+                && self.layout.data.inline_boxes[item.index].kind == InlineBoxKind::InFlowCentered
+        })
+    }
+
     /// Computes the next line in the paragraph. Returns the advance and size
     /// (width and height for horizontal layouts) of the line.
     fn break_next_line_or_box(&mut self) -> Option<YieldData> {
@@ -526,11 +535,23 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                     {
                         // println!("BOX FITS");
 
-                        self.state
-                            .append_inline_box_to_line(next_x, height_contribution);
+                        if inline_box.kind == InlineBoxKind::InFlowCentered {
+                            // Godot's image: a break before it (its U+FFFC is a CB the line
+                            // breaker splits before), never after it, as the shaper flags no
+                            // break on an object's glyph (`text_server_adv.cpp:6629-6632` at
+                            // 4.7.2-stable) and inserts none after one (`:6587`).
+                            if self.state.line.x != 0.0 && !self.follows_centered_box() {
+                                self.state.mark_line_break_opportunity();
+                            }
+                            self.state
+                                .append_inline_box_to_line(next_x, height_contribution);
+                        } else {
+                            self.state
+                                .append_inline_box_to_line(next_x, height_contribution);
 
-                        // We can always line break after an inline box
-                        self.state.mark_line_break_opportunity();
+                            // We can always line break after an inline box
+                            self.state.mark_line_break_opportunity();
+                        }
                     } else {
                         // If we're at the start of the line, this box will never fit, so consume it and accept the overflow.
                         let reason = if self.state.line.x == 0.0 {
@@ -578,7 +599,13 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                             //
                             // We also don't record boundaries when the advance is 0. As we do not want overflowing content to cause extra consecutive
                             // line breaks. We should accept the overflowing fragment in that scenario.
-                            if !is_ligature_continuation && self.state.line.x != 0.0 {
+                            // No break right after an `InFlowCentered` box (Godot's image).
+                            let after_centered_box = self.state.cluster_idx == cluster_start
+                                && self.follows_centered_box();
+                            if !is_ligature_continuation
+                                && self.state.line.x != 0.0
+                                && !after_centered_box
+                            {
                                 self.state.mark_line_break_opportunity();
                                 // break_opportunity = true;
                             }
@@ -642,8 +669,24 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                         else {
                             // Case: cluster is a space character (and wrapping is enabled)
                             //
-                            // We hang any overflowing whitespace and then line-break.
+                            // Godot counts the space after a word against the width: the overflow
+                            // test runs on every glyph, the space's included, before the space
+                            // becomes a break (`servers/text/text_server.cpp:1086` against
+                            // `:1170-1181` at 4.7.2-stable), so a word whose following space
+                            // overflows moves to the next line, and the space is trimmed off the
+                            // line after (`BREAK_TRIM_END_EDGE_SPACES`). Take the previous break if
+                            // there is one (the `godot-wrap` feature).
+                            // Otherwise we hang any overflowing whitespace and then line-break.
                             if is_space && text_wrap_mode == TextWrapMode::Wrap {
+                                #[cfg(feature = "godot-wrap")]
+                                if let Some(prev) = self.state.prev_boundary.take() {
+                                    self.state.reset_to(prev);
+                                    return self.start_new_line(
+                                        BreakReason::Regular,
+                                        max_advance,
+                                        line_indent,
+                                    );
+                                }
                                 if max_height_exceeded {
                                     return self.max_height_break_data(line_height);
                                 }
