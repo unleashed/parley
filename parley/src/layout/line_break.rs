@@ -1219,9 +1219,15 @@ impl<B: Brush> Drop for BreakLines<'_, B> {
 /// its default `SUBPIXEL_POSITIONING_AUTO` (`fs <= SUBPIXEL_POSITIONING_ONE_HALF_MAX_SIZE`,
 /// `modules/text_server_adv/text_server_adv.cpp:7199, 7338-7339` at 4.7.2-stable), so a line's
 /// width is a sum of 1/64 px steps: up to 1/128 px a glyph more than the exact advance, which
-/// tips a word whose line fits within a fraction of a pixel. Above 20 px Godot rounds each glyph
-/// to a whole pixel carrying the remainder (`:7341-7345`), within half a pixel of the exact sum,
-/// which is kept there.
+/// tips a word whose line fits within a fraction of a pixel. Above 20 px the exact advance is
+/// kept.
+/// shortcut: the rule is a non-MSDF font's, the default theme's Open Sans: Godot shapes an MSDF
+/// import (the game's Spectral and Cinzel) at its 128 px source size and scales it
+/// (`text_server_adv.h:389-391`, `text_server_adv.cpp:3327-3328`), so `subpos` holds at every size
+/// and its advances are 26.6 at 128 px, finer than the design size's steps here; and above 20 px
+/// a non-MSDF font's glyphs are rounded to whole pixels carrying the remainder, reset at each
+/// blank (`:7320, 7341-7345`, `keep_rounding_remainders` true by default), which this does not
+/// do. Both need the font's MSDF flag here; add it if a break or a centred line lands on either.
 /// shortcut: the cluster is rounded as one where `HarfBuzz` rounds a glyph's advance and its
 /// kerning apart (1/64 px apart when both fall on a half step); round them apart if a break
 /// lands on that.
