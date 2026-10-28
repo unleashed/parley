@@ -117,6 +117,11 @@ pub enum StyleProperty<'a, B: Brush> {
     OverflowWrap(OverflowWrap),
     /// Control over non-"emergency" line-breaking.
     TextWrapMode(TextWrapMode),
+    /// Whether the text is in a font Godot imports as MSDF (the `godot-wrap` feature): such a
+    /// run keeps its exact advances at every size, where any other font takes Godot's advances of
+    /// a font it rasterises at the design size (26.6 up to 20 px, whole pixels above it).
+    #[cfg(feature = "godot-wrap")]
+    GodotMsdf(bool),
 }
 
 /// Unresolved styles.

@@ -12,6 +12,8 @@ use core_maths::CoreFloat;
 use crate::analysis::Boundary;
 use crate::analysis::cluster::Whitespace;
 use crate::data::ClusterData;
+#[cfg(feature = "godot-wrap")]
+use crate::data::RunData;
 use crate::layout::{
     BreakReason, Layout, LayoutData, LayoutItem, LayoutItemKind, LineData, LineItemData,
     LineMetrics, Run,
@@ -632,6 +634,8 @@ impl<'a, B: Brush> BreakLines<'a, B> {
 
                         // If current cluster is the start of a ligature, then advance state to include
                         // the remaining clusters that make up the ligature
+                        #[cfg(feature = "godot-wrap")]
+                        let first_cluster = self.state.cluster_idx;
                         let mut advance = cluster.advance();
                         if cluster.is_ligature_start() {
                             while let Some(cluster) = run.get(self.state.cluster_idx + 1) {
@@ -649,8 +653,15 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                         // by its text gets, and the one alignment centres), while the glyphs keep
                         // their exact positions.
                         #[cfg(feature = "godot-wrap")]
-                        let advance =
-                            godot_advance(advance, run.font_size(), self.layout.data.scale);
+                        let advance = {
+                            // Godot's rule replaces the exact sum, cluster by cluster.
+                            let _ = advance;
+                            (first_cluster..=self.state.cluster_idx)
+                                .map(|index| {
+                                    godot_cluster_advance(&self.layout.data, run_data, index)
+                                })
+                                .sum::<f32>()
+                        };
 
                         // Compute the x position of the content being currently processed
                         let next_x = self.state.line.x + advance;
@@ -1051,18 +1062,32 @@ impl<'a, B: Brush> BreakLines<'a, B> {
         line.metrics.trailing_whitespace = run
             .filter(|item| item.is_text_run() && item.has_trailing_whitespace)
             .map(|run| {
-                fn whitespace_advance<'c, I: Iterator<Item = &'c ClusterData>>(clusters: I) -> f32 {
+                // A blank is measured as the line's other clusters are (the `godot-wrap`
+                // feature), so the line's length less its trailing blanks is Godot's.
+                #[cfg(feature = "godot-wrap")]
+                let advance_of = |cluster: &ClusterData| {
+                    let data = &self.layout.data;
+                    godot_advance(
+                        [cluster.advance],
+                        data.runs[run.index].font_size,
+                        data.scale,
+                        data.styles[cluster.style_index as usize].godot_msdf,
+                    )
+                };
+                #[cfg(not(feature = "godot-wrap"))]
+                let advance_of = |cluster: &ClusterData| cluster.advance;
+                let whitespace_advance = |clusters: &mut dyn Iterator<Item = &ClusterData>| {
                     clusters
                         .take_while(|cluster| cluster.info.whitespace() != Whitespace::None)
-                        .map(|cluster| cluster.advance)
+                        .map(advance_of)
                         .sum()
-                }
+                };
 
                 let clusters = &self.layout.data.clusters[run.cluster_range.clone()];
                 if run.is_rtl() {
-                    whitespace_advance(clusters.iter())
+                    whitespace_advance(&mut clusters.iter())
                 } else {
-                    whitespace_advance(clusters.iter().rev())
+                    whitespace_advance(&mut clusters.iter().rev())
                 }
             })
             .unwrap_or(0.0);
@@ -1213,32 +1238,79 @@ impl<B: Brush> Drop for BreakLines<'_, B> {
     }
 }
 
-/// Godot's advance of a cluster `advance` px wide in a run of `font_size` px laid out at `scale`
-/// (the `godot-wrap` feature). Godot shapes at the design size (`scale` 1) through `hb_ft`, whose
-/// positions are 26.6 fixed point rounded half up, and keeps them as they are up to 20 px under
-/// its default `SUBPIXEL_POSITIONING_AUTO` (`fs <= SUBPIXEL_POSITIONING_ONE_HALF_MAX_SIZE`,
-/// `modules/text_server_adv/text_server_adv.cpp:7199, 7338-7339` at 4.7.2-stable), so a line's
-/// width is a sum of 1/64 px steps: up to 1/128 px a glyph more than the exact advance, which
-/// tips a word whose line fits within a fraction of a pixel. Above 20 px the exact advance is
-/// kept.
-/// shortcut: the rule is a non-MSDF font's, the default theme's Open Sans: Godot shapes an MSDF
-/// import (the game's Spectral and Cinzel) at its 128 px source size and scales it
-/// (`text_server_adv.h:389-391`, `text_server_adv.cpp:3327-3328`), so `subpos` holds at every size
-/// and its advances are 26.6 at 128 px, finer than the design size's steps here; and above 20 px
-/// a non-MSDF font's glyphs are rounded to whole pixels carrying the remainder, reset at each
-/// blank (`:7320, 7341-7345`, `keep_rounding_remainders` true by default), which this does not
-/// do. Both need the font's MSDF flag here; add it if a break or a centred line lands on either.
-/// shortcut: the cluster is rounded as one where `HarfBuzz` rounds a glyph's advance and its
-/// kerning apart (1/64 px apart when both fall on a half step); round them apart if a break
-/// lands on that.
+/// Godot's advance of the cluster at `index` in `run` (the `godot-wrap` feature): [`godot_advance`]
+/// over the clusters from Godot's last reset of its rounding remainder to this one. Godot shapes
+/// each span of a paragraph apart (`_shape_run`, its `adv_rem` starting at 0,
+/// `modules/text_server_adv/text_server_adv.cpp:7269` at 4.7.2-stable) and resets the remainder
+/// on a blank, a tab or a line break before measuring it (`:7319-7321`), so the remainder runs
+/// from the cluster's last blank or from its style's first cluster in the run, whichever is
+/// nearer (a span is a style here: its brush is its own).
 #[cfg(feature = "godot-wrap")]
-fn godot_advance(advance: f32, font_size: f32, scale: f32) -> f32 {
+fn godot_cluster_advance<B: Brush>(data: &LayoutData<B>, run: &RunData, index: usize) -> f32 {
+    let clusters = &data.clusters;
+    let style = clusters[index].style_index;
+    let mut start = index;
+    while start > run.cluster_range.start
+        && clusters[start].info.whitespace() == Whitespace::None
+        && clusters[start - 1].style_index == style
+    {
+        start -= 1;
+    }
+    godot_advance(
+        clusters[start..=index]
+            .iter()
+            .map(|cluster| cluster.advance),
+        run.font_size,
+        data.scale,
+        data.styles[style as usize].godot_msdf,
+    )
+}
+
+/// Godot's advance of the last cluster of `advances` (each the exact advance in layout px; the
+/// first the one after Godot's last reset of its rounding remainder) in a run of `font_size` px
+/// laid out at `scale` (the `godot-wrap` feature). Godot shapes at the design size (`scale` 1)
+/// through `hb_ft`, whose positions are 26.6 fixed point rounded half up. Up to 20 px under its
+/// default `SUBPIXEL_POSITIONING_AUTO` (`fs <= SUBPIXEL_POSITIONING_ONE_HALF_MAX_SIZE`,
+/// `modules/text_server_adv/text_server_adv.cpp:7199, 7338-7339` at 4.7.2-stable) it keeps them,
+/// so a line's width is a sum of 1/64 px steps: up to 1/128 px a glyph more than the exact
+/// advance, which tips a word whose line fits within a fraction of a pixel. Above 20 px it rounds
+/// each to whole pixels carrying the remainder (`full_adv = adv_rem + advance`, `advance =
+/// round(full_adv)`, `adv_rem = full_adv - advance`, `:7341-7345`, `keep_rounding_remainders` true
+/// by default, `text_server_adv.h:305, 611`), so a line is whole pixels long. An MSDF import
+/// (`msdf`, the game's Spectral and Cinzel) is shaped at its 128 px source size and scaled
+/// (`text_server_adv.h:389-391`, `text_server_adv.cpp:3327-3328`): `subpos` holds at every size
+/// and its 26.6 steps at 128 px are finer than the design size's, so it keeps the exact advance.
+/// shortcut: the cluster is rounded as one where `HarfBuzz` rounds a glyph's advance and its
+/// kerning apart (1/64 px apart when both fall on a half step), and a ligature's components one
+/// by one where Godot rounds its one glyph; round them apart if a break lands on that.
+#[cfg(feature = "godot-wrap")]
+fn godot_advance(
+    advances: impl IntoIterator<Item = f32>,
+    font_size: f32,
+    scale: f32,
+    msdf: bool,
+) -> f32 {
     const HALF_STEP_SLACK: f32 = 1e-3;
-    if font_size > 20.0 * scale + HALF_STEP_SLACK || scale <= 0.0 {
-        return advance;
+    let advances = advances.into_iter();
+    if msdf || scale <= 0.0 {
+        return advances.last().unwrap_or(0.0);
     }
     // The slack keeps a half step that `f32` lands a hair short of rounding up, as `hb_ft` does.
-    (advance / scale * 64.0 + 0.5 + HALF_STEP_SLACK).floor() / 64.0 * scale
+    let step =
+        |advance: f32| f64::from((advance / scale * 64.0 + 0.5 + HALF_STEP_SLACK).floor() / 64.0);
+    if font_size <= 20.0 * scale + HALF_STEP_SLACK {
+        return advances
+            .last()
+            .map_or(0.0, |advance| step(advance) as f32 * scale);
+    }
+    let mut remainder = 0.0;
+    let mut whole = 0.0;
+    for advance in advances {
+        let full = remainder + step(advance);
+        whole = full.round();
+        remainder = full - whole;
+    }
+    whole as f32 * scale
 }
 
 fn commit_line<B: Brush>(
@@ -1436,5 +1508,100 @@ fn reorder_line_items(runs: &mut [LineItemData]) {
             }
             i += 1;
         }
+    }
+}
+
+#[cfg(all(test, feature = "godot-wrap"))]
+mod godot_advance_tests {
+    use super::godot_advance;
+    use alloc::vec::Vec;
+
+    /// Open Sans `SemiBold`'s "Start a New Run?" as `HarfBuzz` shapes it (x advances over 2048
+    /// units per em, kerning in) and whether each is a blank.
+    const TITLE: [(f32, bool); 16] = [
+        (1126.0, false),
+        (810.0, false),
+        (1188.0, false),
+        (884.0, false),
+        (810.0, false),
+        (532.0, true),
+        (1188.0, false),
+        (532.0, true),
+        (1604.0, false),
+        (1180.0, false),
+        (1670.0, false),
+        (532.0, true),
+        (1308.0, false),
+        (1301.0, false),
+        (1301.0, false),
+        (931.0, false),
+    ];
+
+    /// The title's length in design px at `font_size` laid out at `scale`, each cluster measured
+    /// from the last blank as the line breaker does.
+    fn title(font_size: f32, scale: f32, msdf: bool) -> f32 {
+        let per_unit = font_size * scale / 2048.0;
+        let mut since_blank: Vec<f32> = Vec::new();
+        TITLE
+            .iter()
+            .map(|&(advance, blank)| {
+                if blank {
+                    since_blank.clear();
+                }
+                since_blank.push(advance * per_unit);
+                godot_advance(since_blank.iter().copied(), font_size * scale, scale, msdf)
+            })
+            .sum::<f32>()
+            / scale
+    }
+
+    /// An MSDF run keeps parley's exact advance at every size: the title is 198.012 px long at
+    /// 24 px, a 7.3 px cluster at 12 px stays 7.3.
+    #[test]
+    fn an_msdf_run_keeps_its_exact_advances() {
+        let exact = TITLE.iter().map(|&(advance, _)| advance).sum::<f32>() * 24.0 / 2048.0;
+        for scale in [1.0, 5.0 / 3.0, 5.0 / 6.0] {
+            assert!((title(24.0, scale, true) - exact).abs() < 1e-3);
+        }
+        assert!((exact - 198.0117).abs() < 1e-3);
+        assert!((godot_advance([7.3], 12.0, 1.0, true) - 7.3).abs() < 1e-6);
+    }
+
+    /// Up to 20 px a plain run takes the 26.6 step at the design size, cluster by cluster: 9.0390625
+    /// (578.5 / 64) rounds half up to 579 / 64 at every scale, and what came before carries nothing.
+    #[test]
+    fn a_plain_run_up_to_20_px_takes_the_26_6_step() {
+        for scale in [1.0, 5.0 / 3.0, 5.0 / 6.0] {
+            let one = godot_advance([9.039_062_5 * scale], 16.0 * scale, scale, false);
+            assert!(
+                (one / scale - 579.0 / 64.0).abs() < 1e-5,
+                "{one} at {scale}"
+            );
+            let after = godot_advance(
+                [1.7 * scale, 9.039_062_5 * scale],
+                20.0 * scale,
+                scale,
+                false,
+            );
+            assert!(
+                (after / scale - 579.0 / 64.0).abs() < 1e-5,
+                "{after} at {scale}"
+            );
+        }
+    }
+
+    /// Above 20 px a plain run takes whole px, the remainder carried across the run's clusters and
+    /// reset at a blank: the restart title is Godot's 197 at every scale (198.012 exact).
+    #[test]
+    fn a_plain_run_above_20_px_takes_whole_px_with_the_remainder() {
+        for scale in [1.0, 5.0 / 3.0, 5.0 / 6.0] {
+            let line = title(24.0, scale, false);
+            assert!((line - 197.0).abs() < 1e-3, "{line} at {scale}");
+        }
+        // 10.6 three times: 11 (remainder -0.4), 10 (10.2, remainder 0.2), 11 (10.8, -0.2).
+        let whole: Vec<f32> = (1..=3)
+            .map(|n| godot_advance([10.6_f32; 3][..n].iter().copied(), 22.0, 1.0, false))
+            .collect();
+        assert_eq!(whole, [11.0, 10.0, 11.0]);
     }
 }
