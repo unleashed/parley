@@ -51,7 +51,7 @@ pub(crate) fn load_fonts(
     Ok(())
 }
 
-fn create_font_context() -> FontContext {
+pub(crate) fn create_font_context() -> FontContext {
     let mut collection = Collection::new(CollectionOptions {
         shared: false,
         system_fonts: false,

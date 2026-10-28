@@ -6,6 +6,8 @@ use crate::layout::data::BreakReason;
 use crate::layout::data::{LayoutItemKind, LineData};
 use crate::layout::glyph::Glyph;
 use crate::layout::layout::Layout;
+#[cfg(feature = "godot-wrap")]
+use crate::layout::line_break::{godot_cluster_advance, godot_cluster_pen};
 use crate::layout::run::Run;
 use crate::style::Brush;
 use crate::{InlineBox, InlineBoxKind};
@@ -224,9 +226,7 @@ impl<'a, B: Brush> GlyphRun<'a, B> {
 
     /// Returns an iterator over the glyphs in the run.
     pub fn glyphs(&'a self) -> impl Iterator<Item = Glyph> + 'a + Clone {
-        self.run
-            .visual_clusters()
-            .flat_map(|cluster| cluster.glyphs())
+        run_glyphs(&self.run)
             .skip(self.glyph_start)
             .take(self.glyph_count)
     }
@@ -242,6 +242,48 @@ impl<'a, B: Brush> GlyphRun<'a, B> {
             g
         })
     }
+}
+
+/// The glyphs of `run` in visual order, as [`GlyphRun::glyphs`] and the line's glyph runs take
+/// them.
+#[cfg(not(feature = "godot-wrap"))]
+fn run_glyphs<'a, B: Brush>(run: &'a Run<'a, B>) -> impl Iterator<Item = Glyph> + 'a + Clone {
+    run.visual_clusters().flat_map(|cluster| cluster.glyphs())
+}
+
+/// The glyphs of `run` in visual order, as [`GlyphRun::glyphs`] and the line's glyph runs take
+/// them (the `godot-wrap` feature): each glyph at Godot's x offset and each cluster Godot's
+/// advance (`line_break::GodotPen`), so a glyph sits on Godot's pen (a plain font above 20 px: whole px with
+/// the remainder carried; up to 20 px: 26.6 steps; an MSDF import: exact) and a style run's
+/// glyphs sum to the line breaker's measure. A cluster's advance goes to its last glyph, the
+/// others keep theirs; a ligature's components, which carry no glyph, add theirs to it.
+#[cfg(feature = "godot-wrap")]
+fn run_glyphs<'a, B: Brush>(run: &'a Run<'a, B>) -> impl Iterator<Item = Glyph> + 'a + Clone {
+    run.visual_clusters().flat_map(|cluster| {
+        let data = &cluster.run.layout.data;
+        let run_data = cluster.run.data;
+        let range = cluster.run.cluster_range();
+        let index = range.start + cluster.path.logical_index();
+        let mut pen = godot_cluster_pen(data, run_data, index);
+        let mut advance = pen.advance(data.clusters[index].advance);
+        advance += (index + 1..range.end)
+            .take_while(|&next| {
+                data.clusters[next].is_ligature_component() && data.clusters[next].glyph_len == 0
+            })
+            .map(|next| godot_cluster_advance(data, run_data, next))
+            .sum::<f32>();
+        let count = cluster.glyphs().count();
+        let mut before = 0.0;
+        cluster.glyphs().enumerate().map(move |(at, mut glyph)| {
+            glyph.x = pen.offset(glyph.x);
+            if at + 1 == count {
+                glyph.advance = advance - before;
+            } else {
+                before += glyph.advance;
+            }
+            glyph
+        })
+    })
 }
 
 #[derive(Clone)]
@@ -289,10 +331,7 @@ impl<'a, B: Brush> Iterator for GlyphRunIter<'a, B> {
                     }));
                 }
                 LineItem::Run(run) => {
-                    let mut iter = run
-                        .visual_clusters()
-                        .flat_map(|c| c.glyphs())
-                        .skip(self.glyph_start);
+                    let mut iter = run_glyphs(&run).skip(self.glyph_start);
 
                     if let Some(first) = iter.next() {
                         let mut advance = first.advance;

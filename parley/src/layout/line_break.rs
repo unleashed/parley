@@ -1238,15 +1238,19 @@ impl<B: Brush> Drop for BreakLines<'_, B> {
     }
 }
 
-/// Godot's advance of the cluster at `index` in `run` (the `godot-wrap` feature): [`godot_advance`]
-/// over the clusters from Godot's last reset of its rounding remainder to this one. Godot shapes
-/// each span of a paragraph apart (`_shape_run`, its `adv_rem` starting at 0,
-/// `modules/text_server_adv/text_server_adv.cpp:7269` at 4.7.2-stable) and resets the remainder
-/// on a blank, a tab or a line break before measuring it (`:7319-7321`), so the remainder runs
-/// from the cluster's last blank or from its style's first cluster in the run, whichever is
-/// nearer (a span is a style here: its brush is its own).
+/// Godot's pen before the cluster at `index` in `run` (the `godot-wrap` feature): a
+/// [`GodotPen`] carried over the clusters from Godot's last reset of its rounding remainder to
+/// this one. Godot shapes each span of a paragraph apart (`_shape_run`, its `adv_rem` starting at
+/// 0, `modules/text_server_adv/text_server_adv.cpp:7269` at 4.7.2-stable) and resets the
+/// remainder on a blank, a tab or a line break before measuring it (`:7319-7321`), so the
+/// remainder runs from the cluster's last blank or from its style's first cluster in the run,
+/// whichever is nearer (a span is a style here: its brush is its own).
 #[cfg(feature = "godot-wrap")]
-fn godot_cluster_advance<B: Brush>(data: &LayoutData<B>, run: &RunData, index: usize) -> f32 {
+pub(crate) fn godot_cluster_pen<B: Brush>(
+    data: &LayoutData<B>,
+    run: &RunData,
+    index: usize,
+) -> GodotPen {
     let clusters = &data.clusters;
     let style = clusters[index].style_index;
     let mut start = index;
@@ -1256,33 +1260,31 @@ fn godot_cluster_advance<B: Brush>(data: &LayoutData<B>, run: &RunData, index: u
     {
         start -= 1;
     }
-    godot_advance(
-        clusters[start..=index]
-            .iter()
-            .map(|cluster| cluster.advance),
+    let mut pen = GodotPen::new(
         run.font_size,
         data.scale,
         data.styles[style as usize].godot_msdf,
-    )
+    );
+    for cluster in &clusters[start..index] {
+        pen.advance(cluster.advance);
+    }
+    pen
+}
+
+/// Godot's advance of the cluster at `index` in `run` (the `godot-wrap` feature): its
+/// [`godot_cluster_pen`] advanced over it.
+#[cfg(feature = "godot-wrap")]
+pub(crate) fn godot_cluster_advance<B: Brush>(
+    data: &LayoutData<B>,
+    run: &RunData,
+    index: usize,
+) -> f32 {
+    godot_cluster_pen(data, run, index).advance(data.clusters[index].advance)
 }
 
 /// Godot's advance of the last cluster of `advances` (each the exact advance in layout px; the
 /// first the one after Godot's last reset of its rounding remainder) in a run of `font_size` px
-/// laid out at `scale` (the `godot-wrap` feature). Godot shapes at the design size (`scale` 1)
-/// through `hb_ft`, whose positions are 26.6 fixed point rounded half up. Up to 20 px under its
-/// default `SUBPIXEL_POSITIONING_AUTO` (`fs <= SUBPIXEL_POSITIONING_ONE_HALF_MAX_SIZE`,
-/// `modules/text_server_adv/text_server_adv.cpp:7199, 7338-7339` at 4.7.2-stable) it keeps them,
-/// so a line's width is a sum of 1/64 px steps: up to 1/128 px a glyph more than the exact
-/// advance, which tips a word whose line fits within a fraction of a pixel. Above 20 px it rounds
-/// each to whole pixels carrying the remainder (`full_adv = adv_rem + advance`, `advance =
-/// round(full_adv)`, `adv_rem = full_adv - advance`, `:7341-7345`, `keep_rounding_remainders` true
-/// by default, `text_server_adv.h:305, 611`), so a line is whole pixels long. An MSDF import
-/// (`msdf`, the game's Spectral and Cinzel) is shaped at its 128 px source size and scaled
-/// (`text_server_adv.h:389-391`, `text_server_adv.cpp:3327-3328`): `subpos` holds at every size
-/// and its 26.6 steps at 128 px are finer than the design size's, so it keeps the exact advance.
-/// shortcut: the cluster is rounded as one where `HarfBuzz` rounds a glyph's advance and its
-/// kerning apart (1/64 px apart when both fall on a half step), and a ligature's components one
-/// by one where Godot rounds its one glyph; round them apart if a break lands on that.
+/// laid out at `scale` (the `godot-wrap` feature): a [`GodotPen`] carried over them.
 #[cfg(feature = "godot-wrap")]
 fn godot_advance(
     advances: impl IntoIterator<Item = f32>,
@@ -1290,28 +1292,108 @@ fn godot_advance(
     scale: f32,
     msdf: bool,
 ) -> f32 {
-    const HALF_STEP_SLACK: f32 = 1e-3;
-    let advances = advances.into_iter();
-    if msdf || scale <= 0.0 {
-        return advances.last().unwrap_or(0.0);
-    }
-    // The slack keeps a half step that `f32` lands a hair short of rounding up, as `hb_ft` does.
-    let step =
-        |advance: f32| f64::from((advance / scale * 64.0 + 0.5 + HALF_STEP_SLACK).floor() / 64.0);
-    if font_size <= 20.0 * scale + HALF_STEP_SLACK {
-        return advances
-            .last()
-            .map_or(0.0, |advance| step(advance) as f32 * scale);
-    }
-    let mut remainder = 0.0;
-    let mut whole = 0.0;
-    for advance in advances {
-        let full = remainder + step(advance);
-        whole = full.round();
-        remainder = full - whole;
-    }
-    whole as f32 * scale
+    let mut pen = GodotPen::new(font_size, scale, msdf);
+    advances
+        .into_iter()
+        .map(|advance| pen.advance(advance))
+        .last()
+        .unwrap_or(0.0)
 }
+
+/// Godot's text server's pen along a run of one font and size (the `godot-wrap` feature): what
+/// it makes of each glyph's exact advance and x offset, the line breaker's measure and the
+/// glyphs' placement alike. Godot shapes at the design size (`scale` 1) through `hb_ft`, whose
+/// positions are 26.6 fixed point rounded half up. Up to 20 px under its default
+/// `SUBPIXEL_POSITIONING_AUTO` (`fs <= SUBPIXEL_POSITIONING_ONE_HALF_MAX_SIZE`,
+/// `modules/text_server_adv/text_server_adv.cpp:7199, 7326, 7338-7339` at 4.7.2-stable) it keeps
+/// them, so a line's width is a sum of 1/64 px steps: up to 1/128 px a glyph more than the exact
+/// advance, which tips a word whose line fits within a fraction of a pixel. Above 20 px it rounds
+/// each to whole pixels carrying the remainder (`x_off = round(adv_rem + x_offset)`, `:7326-7327`;
+/// `full_adv = adv_rem + advance`, `advance = round(full_adv)`, `adv_rem = full_adv - advance`,
+/// `:7341-7345`, `keep_rounding_remainders` true by default, `text_server_adv.h:305, 611`), so a
+/// line is whole pixels long and each glyph sits on the whole-px pen (`shaped_text_draw` draws a
+/// glyph at the sum of the advances before it plus its `x_off`, `servers/text/text_server.cpp
+/// :1765-1828`). An MSDF import (`msdf`, the game's Spectral and Cinzel) is shaped at its 128 px
+/// source size and scaled (`text_server_adv.h:389-391`, `text_server_adv.cpp:3327-3328`): `subpos`
+/// holds at every size and its 26.6 steps at 128 px are finer than the design size's, so it keeps
+/// the exact advance and offset.
+/// shortcut: the cluster is rounded as one where `HarfBuzz` rounds a glyph's advance and its
+/// kerning apart (1/64 px apart when both fall on a half step), and a ligature's components one
+/// by one where Godot rounds its one glyph; round them apart if a break lands on that. Godot's
+/// embolden extra advance (`_get_extra_advance`, `:3508-3520`, 0.0025 px a glyph on the HUD's
+/// numbers) is not added; add it if a line's length lands on it.
+#[cfg(feature = "godot-wrap")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GodotPen {
+    scale: f32,
+    /// What Godot does with the run's glyphs: keeps them exact (an MSDF import), on 26.6 steps
+    /// (up to 20 px) or on whole px (above).
+    rule: GodotRule,
+    /// `adv_rem`, design px.
+    remainder: f64,
+}
+
+#[cfg(feature = "godot-wrap")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GodotRule {
+    Exact,
+    Steps,
+    Whole,
+}
+
+#[cfg(feature = "godot-wrap")]
+impl GodotPen {
+    /// The pen at a run's start or after a reset, for a run of `font_size` layout px laid out at
+    /// `scale`, in an MSDF import or not.
+    pub(crate) fn new(font_size: f32, scale: f32, msdf: bool) -> Self {
+        // The slack keeps a size or a half step that `f32` lands a hair off, as `hb_ft` does.
+        let rule = if msdf || scale <= 0.0 {
+            GodotRule::Exact
+        } else if font_size <= 20.0 * scale + HALF_STEP_SLACK {
+            GodotRule::Steps
+        } else {
+            GodotRule::Whole
+        };
+        Self {
+            scale,
+            rule,
+            remainder: 0.0,
+        }
+    }
+
+    /// `hb_ft`'s 26.6 position of `value` layout px, design px.
+    fn step(self, value: f32) -> f64 {
+        f64::from((value / self.scale * 64.0 + 0.5 + HALF_STEP_SLACK).floor() / 64.0)
+    }
+
+    /// Godot's x offset of a glyph whose exact offset is `x` (layout px) at the pen's remainder,
+    /// layout px; the pen does not move.
+    pub(crate) fn offset(self, x: f32) -> f32 {
+        match self.rule {
+            GodotRule::Exact | GodotRule::Steps => x,
+            GodotRule::Whole => (self.remainder + self.step(x)).round() as f32 * self.scale,
+        }
+    }
+
+    /// Godot's advance of the next cluster, whose exact advance is `advance` (layout px), layout
+    /// px; the pen carries the remainder.
+    pub(crate) fn advance(&mut self, advance: f32) -> f32 {
+        match self.rule {
+            GodotRule::Exact => advance,
+            GodotRule::Steps => self.step(advance) as f32 * self.scale,
+            GodotRule::Whole => {
+                let full = self.remainder + self.step(advance);
+                let whole = full.round();
+                self.remainder = full - whole;
+                whole as f32 * self.scale
+            }
+        }
+    }
+}
+
+/// Slack on Godot's 20 px threshold and `hb_ft`'s half step, see [`GodotPen`].
+#[cfg(feature = "godot-wrap")]
+const HALF_STEP_SLACK: f32 = 1e-3;
 
 fn commit_line<B: Brush>(
     layout: &Layout<B>,
@@ -1513,7 +1595,7 @@ fn reorder_line_items(runs: &mut [LineItemData]) {
 
 #[cfg(all(test, feature = "godot-wrap"))]
 mod godot_advance_tests {
-    use super::godot_advance;
+    use super::{GodotPen, godot_advance};
     use alloc::vec::Vec;
 
     /// Open Sans `SemiBold`'s "Start a New Run?" as `HarfBuzz` shapes it (x advances over 2048
@@ -1603,5 +1685,32 @@ mod godot_advance_tests {
             .map(|n| godot_advance([10.6_f32; 3][..n].iter().copied(), 22.0, 1.0, false))
             .collect();
         assert_eq!(whole, [11.0, 10.0, 11.0]);
+    }
+
+    /// Godot's pens on the restart title, design px (its 4.7.2 harness prints them from
+    /// `get_character_bounds`): the carried whole-px sum, the "?" 1.10 px left of exact.
+    #[test]
+    fn the_restart_title_s_pens_are_godots() {
+        const GODOT: [f32; 16] = [
+            0.0, 13.0, 23.0, 37.0, 47.0, 56.0, 62.0, 76.0, 82.0, 101.0, 115.0, 134.0, 140.0, 156.0,
+            171.0, 186.0,
+        ];
+        for scale in [1.0, 5.0 / 3.0, 5.0 / 6.0] {
+            let per_unit = 24.0 * scale / 2048.0;
+            let mut pen = GodotPen::new(24.0 * scale, scale, false);
+            let (mut at, mut exact) = (0.0, 0.0);
+            for (&(advance, blank), godot) in TITLE.iter().zip(GODOT) {
+                if blank {
+                    pen = GodotPen::new(24.0 * scale, scale, false);
+                }
+                assert!(((at + pen.offset(0.0)) / scale - godot).abs() < 1e-3);
+                if godot == 186.0 {
+                    assert!((godot - exact - -1.1016).abs() < 1e-3, "{exact}");
+                }
+                at += pen.advance(advance * per_unit);
+                exact += advance * 24.0 / 2048.0;
+            }
+            assert!((at / scale - 197.0).abs() < 1e-3);
+        }
     }
 }

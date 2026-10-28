@@ -3,4 +3,6 @@
 
 mod test_analysis;
 mod test_builders;
+#[cfg(feature = "godot-wrap")]
+mod test_godot_pen;
 mod utils;
